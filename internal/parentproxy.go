@@ -465,6 +465,23 @@ func (conn *socksUDPConn) SetWriteDeadline(deadline time.Time) error {
 	return conn.udpConn.SetWriteDeadline(deadline)
 }
 
+// SetReadBuffer and SetWriteBuffer allow quic-go to tune the underlying UDP
+// socket. They deliberately do not expose SyscallConn or ReadMsgUDP, which
+// would let quic-go bypass the SOCKS UDP framing methods above.
+func (conn *socksUDPConn) SetReadBuffer(bytes int) error {
+	if conn.udpConn == nil {
+		return net.ErrClosed
+	}
+	return conn.udpConn.SetReadBuffer(bytes)
+}
+
+func (conn *socksUDPConn) SetWriteBuffer(bytes int) error {
+	if conn.udpConn == nil {
+		return net.ErrClosed
+	}
+	return conn.udpConn.SetWriteBuffer(bytes)
+}
+
 func sameUDPAddr(first, second *net.UDPAddr) bool {
 	return first != nil && second != nil && first.Port == second.Port && first.IP.Equal(second.IP)
 }

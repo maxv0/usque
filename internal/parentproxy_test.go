@@ -158,6 +158,12 @@ func TestListenPacketAssociatesActualUDPPort(t *testing.T) {
 func TestSOCKSUDPConnDoesNotExposeUDPOptimizations(t *testing.T) {
 	var packetConn net.PacketConn = &socksUDPConn{}
 	if _, ok := packetConn.(interface {
+		SetReadBuffer(int) error
+		SetWriteBuffer(int) error
+	}); !ok {
+		t.Fatal("socksUDPConn does not expose buffer sizing for quic-go")
+	}
+	if _, ok := packetConn.(interface {
 		SyscallConn() (syscall.RawConn, error)
 	}); ok {
 		t.Fatal("socksUDPConn exposes SyscallConn, allowing quic-go to bypass SOCKS UDP encapsulation")
