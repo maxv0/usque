@@ -363,7 +363,7 @@ $ ./usque portfw -R 100.96.0.3:8080:localhost:8080 -L localhost:8081:100.96.0.2:
 ```
 
 > [!TIP]
-> The syntax isn't exactly like the one from SSH. I suggest that you specify the syntax as seen in the example preferably with IP addresses and not hosts.
+> The syntax isn't exactly like the one from SSH. Use `[bind_address:]local_port:remote_host:remote_port`; bracket IPv6 bind addresses and IPv6 remote addresses when that avoids ambiguity, for example `[::1]:8080:[2001:db8::1]:443`. Remote hostnames are resolved when a connection is opened: local forwards resolve them through the tunnel DNS path, while remote forwards use the configured host or parent-proxy path.
 
 > [!TIP]
 > Any number of ports are supported. You can chain many ports together if you specify the flag and the corresponding argument one after another.

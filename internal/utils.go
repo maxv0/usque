@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ import (
 type PortMapping struct {
 	BindAddress string // The address to bind the local port.
 	LocalPort   int    // The local port number.
-	RemoteIP    string // The remote destination IP address.
+	RemoteIP    string // The remote destination hostname or IP address.
 	RemotePort  int    // The remote destination port number.
 }
 
@@ -154,35 +155,30 @@ func DefaultQuicConfig(keepalivePeriod time.Duration, initialPacketSize uint16) 
 //   - int: The remote port.
 //   - error: An error if parsing fails.
 func parsePortMapping(port string) (bindAddress string, localPort int, remoteHost string, remotePort int, err error) {
-	parts := strings.Split(port, ":")
-
-	// Handle IPv6 addresses (which are enclosed in brackets)
-	if len(parts) >= 4 && strings.HasPrefix(parts[0], "[") && strings.Contains(parts[0], "]") {
-		bindAddress = parts[0]
-		parts = parts[1:] // Shift parts forward
-	} else if len(parts) == 3 {
-		bindAddress = "localhost" // Default to localhost
-	} else if len(parts) == 4 {
-		bindAddress = parts[0]
-		parts = parts[1:] // Shift forward
-	} else {
+	port = strings.TrimSpace(port)
+	if port == "" {
 		return "", 0, "", 0, errors.New("invalid port mapping format (expected format: [bind_address:]local_port:remote_host:remote_port)")
 	}
 
-	// Parse local port
-	localPort, err = strconv.Atoi(parts[0])
+	bindAddress, localPort, remoteEndpoint, err := splitPortMappingPrefix(port)
+	if err != nil {
+		return "", 0, "", 0, err
+	}
+
+	remoteHost, remotePort, err = splitPortMappingRemote(remoteEndpoint)
+	if err != nil {
+		return "", 0, "", 0, err
+	}
+
 	if err != nil || localPort <= 0 || localPort > 65535 {
 		return "", 0, "", 0, errors.New("invalid local port")
 	}
 
 	// Validate remote host (allow both hostnames and IPs)
-	remoteHost = parts[1]
-	if net.ParseIP(remoteHost) == nil && !isValidHostname(remoteHost) {
+	if !isValidHost(remoteHost) {
 		return "", 0, "", 0, errors.New("invalid remote hostname/IP")
 	}
 
-	// Parse remote port
-	remotePort, err = strconv.Atoi(parts[2])
 	if err != nil || remotePort <= 0 || remotePort > 65535 {
 		return "", 0, "", 0, errors.New("invalid remote port")
 	}
@@ -203,12 +199,74 @@ func parsePortMapping(port string) (bindAddress string, localPort int, remoteHos
 		return "", 0, "", 0, errors.New("invalid local address: " + err.Error())
 	}
 
-	remoteHost, err = resolveBindAddress(remoteHost)
-	if err != nil {
-		return "", 0, "", 0, errors.New("invalid remote address: " + err.Error())
+	return bindAddress, localPort, remoteHost, remotePort, nil
+}
+
+func splitPortMappingPrefix(mapping string) (bindAddress string, localPort int, remoteEndpoint string, err error) {
+	if strings.HasPrefix(mapping, "[") {
+		end := strings.Index(mapping, "]:")
+		if end < 0 {
+			return "", 0, "", errors.New("invalid local address")
+		}
+		bindAddress = mapping[1:end]
+		remainder := mapping[end+2:]
+		localPortText, remoteEndpoint, ok := strings.Cut(remainder, ":")
+		if !ok {
+			return "", 0, "", errors.New("invalid port mapping format (expected format: [bind_address:]local_port:remote_host:remote_port)")
+		}
+		localPort, err = parsePort(localPortText, "local")
+		return bindAddress, localPort, remoteEndpoint, err
 	}
 
-	return bindAddress, localPort, remoteHost, remotePort, nil
+	first, remainder, ok := strings.Cut(mapping, ":")
+	if !ok {
+		return "", 0, "", errors.New("invalid port mapping format (expected format: [bind_address:]local_port:remote_host:remote_port)")
+	}
+	if localPort, err = parsePort(first, "local"); err == nil {
+		return "localhost", localPort, remainder, nil
+	}
+
+	localPortText, remoteEndpoint, ok := strings.Cut(remainder, ":")
+	if !ok {
+		return "", 0, "", errors.New("invalid port mapping format (expected format: [bind_address:]local_port:remote_host:remote_port)")
+	}
+	localPort, err = parsePort(localPortText, "local")
+	if err != nil {
+		return "", 0, "", err
+	}
+	return first, localPort, remoteEndpoint, nil
+}
+
+func splitPortMappingRemote(endpoint string) (host string, port int, err error) {
+	if strings.HasPrefix(endpoint, "[") {
+		host, portText, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			return "", 0, errors.New("invalid remote address")
+		}
+		port, err = parsePort(portText, "remote")
+		return host, port, err
+	}
+
+	if host, portText, splitErr := net.SplitHostPort(endpoint); splitErr == nil {
+		port, err = parsePort(portText, "remote")
+		return host, port, err
+	}
+
+	idx := strings.LastIndex(endpoint, ":")
+	if idx <= 0 || idx == len(endpoint)-1 {
+		return "", 0, errors.New("invalid remote address")
+	}
+	host = endpoint[:idx]
+	port, err = parsePort(endpoint[idx+1:], "remote")
+	return host, port, err
+}
+
+func parsePort(port string, name string) (int, error) {
+	parsed, err := strconv.Atoi(port)
+	if err != nil || parsed <= 0 || parsed > 65535 {
+		return 0, errors.New("invalid " + name + " port")
+	}
+	return parsed, nil
 }
 
 // ParsePortMapping parses a port mapping string into a structured PortMapping.
@@ -244,7 +302,7 @@ func ParsePortMapping(port string) (PortMapping, error) {
 //   - string: The resolved IP address.
 //   - error:  An error if resolution fails.
 func resolveBindAddress(addr string) (string, error) {
-	tcpAddr, err := net.ResolveTCPAddr("tcp", addr+":0") // Resolve the address
+	tcpAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(addr, "0"))
 	if err != nil {
 		return "", err
 	}
@@ -265,6 +323,16 @@ func isValidHostname(hostname string) bool {
 		return true
 	}
 	return strings.Contains(hostname, ".")
+}
+
+func isValidHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	return isValidHostname(host)
 }
 
 // LoginToBase64 encodes a username and password into a base64-encoded string in "username:password" format.

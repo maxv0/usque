@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"github.com/vomw/usque/api"
@@ -274,7 +275,7 @@ var portFwCmd = &cobra.Command{
 		// Start Local Port Forwarding (-L)
 		for _, pm := range localPortMappings {
 			go func(pm internal.PortMapping) {
-				err := forwardPort(tunNet, parentProxy, pm, false) // false = local forwarding
+				err := forwardPort(tunNet, parentProxy, dnsAddrs, pm, false) // false = local forwarding
 				if err != nil {
 					cmd.Printf("Error in local forwarding %d: %v\n", pm.LocalPort, err)
 				}
@@ -284,7 +285,7 @@ var portFwCmd = &cobra.Command{
 		// Start Remote Port Forwarding (-R)
 		for _, pm := range remotePortMappings {
 			go func(pm internal.PortMapping) {
-				err := forwardPort(tunNet, parentProxy, pm, true) // true = remote forwarding
+				err := forwardPort(tunNet, parentProxy, dnsAddrs, pm, true) // true = remote forwarding
 				if err != nil {
 					cmd.Printf("Error in remote forwarding %d: %v\n", pm.LocalPort, err)
 				}
@@ -323,8 +324,9 @@ var portFwCmd = &cobra.Command{
 //
 // Returns:
 //   - error: An error if port forwarding fails; otherwise, nil.
-func forwardPort(netstackNet *netstack.Net, parentProxy *internal.ParentProxy, pm internal.PortMapping, isRemote bool) error {
-	localAddrPort, err := netip.ParseAddrPort(fmt.Sprintf("%s:%d", pm.BindAddress, pm.LocalPort))
+func forwardPort(netstackNet *netstack.Net, parentProxy *internal.ParentProxy, dnsAddrs []netip.Addr, pm internal.PortMapping, isRemote bool) error {
+	localAddress := net.JoinHostPort(pm.BindAddress, strconv.Itoa(pm.LocalPort))
+	localAddrPort, err := netip.ParseAddrPort(localAddress)
 	if err != nil {
 		return fmt.Errorf("invalid local address: %w", err)
 	}
@@ -337,7 +339,7 @@ func forwardPort(netstackNet *netstack.Net, parentProxy *internal.ParentProxy, p
 		}
 		defer func() { _ = listener.Close() }()
 
-		log.Printf("Remote forwarding: Listening on MASQUE network %s, forwarding to local %s:%d", localAddrPort, pm.RemoteIP, pm.RemotePort)
+		log.Printf("Remote forwarding: Listening on MASQUE network %s, forwarding to local %s", localAddrPort, remoteAddress(pm))
 
 		for {
 			conn, err := listener.Accept()
@@ -346,26 +348,26 @@ func forwardPort(netstackNet *netstack.Net, parentProxy *internal.ParentProxy, p
 				continue
 			}
 
-			go handleConnection(conn, pm, isRemote, netstackNet, parentProxy)
+			go handleConnection(conn, pm, isRemote, netstackNet, parentProxy, dnsAddrs)
 		}
 	} else {
 		// Local forwarding: Listen on local machine
-		listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", pm.BindAddress, pm.LocalPort))
+		listener, err := net.Listen("tcp", localAddress)
 		if err != nil {
-			return fmt.Errorf("failed to listen on %s:%d: %w", pm.BindAddress, pm.LocalPort, err)
+			return fmt.Errorf("failed to listen on %s: %w", localAddress, err)
 		}
 		defer func() { _ = listener.Close() }()
 
-		log.Printf("Local forwarding: Listening on %s:%d, forwarding to remote %s:%d", pm.BindAddress, pm.LocalPort, pm.RemoteIP, pm.RemotePort)
+		log.Printf("Local forwarding: Listening on %s, forwarding to remote %s", localAddress, remoteAddress(pm))
 
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				log.Printf("Accept error on %s:%d: %v", pm.BindAddress, pm.LocalPort, err)
+				log.Printf("Accept error on %s: %v", localAddress, err)
 				continue
 			}
 
-			go handleConnection(conn, pm, isRemote, netstackNet, parentProxy)
+			go handleConnection(conn, pm, isRemote, netstackNet, parentProxy, dnsAddrs)
 		}
 	}
 }
@@ -377,32 +379,58 @@ func forwardPort(netstackNet *netstack.Net, parentProxy *internal.ParentProxy, p
 //   - pm: internal.PortMapping - The port mapping configuration.
 //   - isRemote: bool - Indicates whether the connection is remote-forwarded.
 //   - tunNet: *netstack.Net - The network stack used for making remote connections.
-func handleConnection(localConn net.Conn, pm internal.PortMapping, isRemote bool, tunNet *netstack.Net, parentProxy *internal.ParentProxy) {
+func handleConnection(localConn net.Conn, pm internal.PortMapping, isRemote bool, tunNet *netstack.Net, parentProxy *internal.ParentProxy, dnsAddrs []netip.Addr) {
 	defer func() { _ = localConn.Close() }()
 
-	remoteAddrPort, err := netip.ParseAddrPort(fmt.Sprintf("%s:%d", pm.RemoteIP, pm.RemotePort))
-	if err != nil {
-		log.Printf("Invalid remote address: %v", err)
-		return
-	}
+	ctx := context.Background()
+	remoteEndpoint := remoteAddress(pm)
 
 	var remoteConn net.Conn
+	var err error
 	if isRemote {
 		// Remote forwarding: Connect to the external remote host
-		remoteConn, err = parentProxy.DialContext(context.Background(), "tcp", remoteAddrPort.String())
+		remoteConn, err = parentProxy.DialContext(ctx, "tcp", remoteEndpoint)
 	} else {
 		// Local forwarding: Connect inside the tunnel network
-		remoteConn, err = tunNet.DialContext(context.Background(), "tcp", remoteAddrPort.String())
+		remoteEndpoint, err = resolveTunnelRemote(ctx, pm, tunNet, dnsAddrs)
+		if err != nil {
+			log.Printf("Failed to resolve remote %s: %v", remoteAddress(pm), err)
+			return
+		}
+		remoteConn, err = tunNet.DialContext(ctx, "tcp", remoteEndpoint)
 	}
 
 	if err != nil {
-		log.Printf("Failed to connect to remote %s: %v", remoteAddrPort, err)
+		log.Printf("Failed to connect to remote %s: %v", remoteEndpoint, err)
 		return
 	}
 	defer func() { _ = remoteConn.Close() }()
 
 	go func() { _, _ = io.Copy(remoteConn, localConn) }()
 	_, _ = io.Copy(localConn, remoteConn)
+}
+
+func remoteAddress(pm internal.PortMapping) string {
+	return net.JoinHostPort(pm.RemoteIP, strconv.Itoa(pm.RemotePort))
+}
+
+func resolveTunnelRemote(ctx context.Context, pm internal.PortMapping, tunNet *netstack.Net, dnsAddrs []netip.Addr) (string, error) {
+	if _, err := netip.ParseAddr(pm.RemoteIP); err == nil {
+		return remoteAddress(pm), nil
+	}
+
+	resolver := internal.TunnelDNSResolver{
+		TunNet:   tunNet,
+		DNSAddrs: dnsAddrs,
+	}
+	ip, err := resolver.Resolve(ctx, pm.RemoteIP)
+	if err != nil {
+		return "", err
+	}
+	if ip == nil {
+		return "", fmt.Errorf("no IP address for %s", pm.RemoteIP)
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(pm.RemotePort)), nil
 }
 
 func init() {
