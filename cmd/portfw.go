@@ -241,6 +241,11 @@ var portFwCmd = &cobra.Command{
 			"USQUE_IPV4": config.AppConfig.IPv4,
 			"USQUE_IPV6": config.AppConfig.IPv6,
 		}
+		parentProxy, err := internal.NewParentProxy(config.AppConfig.ParentProxy)
+		if err != nil {
+			cmd.Printf("Failed to configure parent proxy: %v\n", err)
+			return
+		}
 
 		tunDev, tunNet, err := netstack.CreateNetTUN(localAddresses, dnsAddrs, mtu)
 		if err != nil {
@@ -269,7 +274,7 @@ var portFwCmd = &cobra.Command{
 		// Start Local Port Forwarding (-L)
 		for _, pm := range localPortMappings {
 			go func(pm internal.PortMapping) {
-				err := forwardPort(tunNet, pm, false) // false = local forwarding
+				err := forwardPort(tunNet, parentProxy, pm, false) // false = local forwarding
 				if err != nil {
 					cmd.Printf("Error in local forwarding %d: %v\n", pm.LocalPort, err)
 				}
@@ -279,7 +284,7 @@ var portFwCmd = &cobra.Command{
 		// Start Remote Port Forwarding (-R)
 		for _, pm := range remotePortMappings {
 			go func(pm internal.PortMapping) {
-				err := forwardPort(tunNet, pm, true) // true = remote forwarding
+				err := forwardPort(tunNet, parentProxy, pm, true) // true = remote forwarding
 				if err != nil {
 					cmd.Printf("Error in remote forwarding %d: %v\n", pm.LocalPort, err)
 				}
@@ -318,7 +323,7 @@ var portFwCmd = &cobra.Command{
 //
 // Returns:
 //   - error: An error if port forwarding fails; otherwise, nil.
-func forwardPort(netstackNet *netstack.Net, pm internal.PortMapping, isRemote bool) error {
+func forwardPort(netstackNet *netstack.Net, parentProxy *internal.ParentProxy, pm internal.PortMapping, isRemote bool) error {
 	localAddrPort, err := netip.ParseAddrPort(fmt.Sprintf("%s:%d", pm.BindAddress, pm.LocalPort))
 	if err != nil {
 		return fmt.Errorf("invalid local address: %w", err)
@@ -341,7 +346,7 @@ func forwardPort(netstackNet *netstack.Net, pm internal.PortMapping, isRemote bo
 				continue
 			}
 
-			go handleConnection(conn, pm, isRemote, netstackNet)
+			go handleConnection(conn, pm, isRemote, netstackNet, parentProxy)
 		}
 	} else {
 		// Local forwarding: Listen on local machine
@@ -360,7 +365,7 @@ func forwardPort(netstackNet *netstack.Net, pm internal.PortMapping, isRemote bo
 				continue
 			}
 
-			go handleConnection(conn, pm, isRemote, netstackNet)
+			go handleConnection(conn, pm, isRemote, netstackNet, parentProxy)
 		}
 	}
 }
@@ -372,7 +377,7 @@ func forwardPort(netstackNet *netstack.Net, pm internal.PortMapping, isRemote bo
 //   - pm: internal.PortMapping - The port mapping configuration.
 //   - isRemote: bool - Indicates whether the connection is remote-forwarded.
 //   - tunNet: *netstack.Net - The network stack used for making remote connections.
-func handleConnection(localConn net.Conn, pm internal.PortMapping, isRemote bool, tunNet *netstack.Net) {
+func handleConnection(localConn net.Conn, pm internal.PortMapping, isRemote bool, tunNet *netstack.Net, parentProxy *internal.ParentProxy) {
 	defer func() { _ = localConn.Close() }()
 
 	remoteAddrPort, err := netip.ParseAddrPort(fmt.Sprintf("%s:%d", pm.RemoteIP, pm.RemotePort))
@@ -384,7 +389,7 @@ func handleConnection(localConn net.Conn, pm internal.PortMapping, isRemote bool
 	var remoteConn net.Conn
 	if isRemote {
 		// Remote forwarding: Connect to the external remote host
-		remoteConn, err = net.Dial("tcp", remoteAddrPort.String())
+		remoteConn, err = parentProxy.DialContext(context.Background(), "tcp", remoteAddrPort.String())
 	} else {
 		// Local forwarding: Connect inside the tunnel network
 		remoteConn, err = tunNet.DialContext(context.Background(), "tcp", remoteAddrPort.String())

@@ -11,11 +11,16 @@ import (
 )
 
 // TunnelDNSResolver implements a DNS resolver that uses the provided DNS servers
-// either inside a MASQUE tunnel (if TunNet is set) or over the system network (if TunNet is nil).
+// either inside a MASQUE tunnel (if TunNet is set), through ParentProxy, or
+// over the system network when neither is configured.
 type TunnelDNSResolver struct {
 	// TunNet is the network stack for the tunnel you want to use for DNS resolution.
 	// If nil, DNS queries are sent over the system network.
 	TunNet *netstack.Net
+
+	// ParentProxy carries host-network DNS through a parent SOCKS proxy. TunNet
+	// takes precedence because tunnel DNS is already carried by the MASQUE path.
+	ParentProxy *ParentProxy
 
 	// DNSAddrs is the list of DNS servers to use for resolution.
 	DNSAddrs []netip.Addr
@@ -29,8 +34,8 @@ type TunnelDNSResolver struct {
 }
 
 // Resolve performs a DNS lookup using the provided DNS resolvers.
-// It tries each resolver in order until one succeeds, sending queries either through the tunnel
-// or over the system network depending on TunNet.
+// It tries each resolver in order until one succeeds, sending queries through
+// the tunnel, the configured parent proxy, or the system network.
 func (r TunnelDNSResolver) Resolve(ctx context.Context, name string) (net.IP, error) {
 	if r.UseOSResolver {
 		queryCtx := ctx
@@ -75,9 +80,11 @@ func (r TunnelDNSResolver) Resolve(ctx context.Context, name string) (net.IP, er
 				dialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
 					return r.TunNet.DialContext(ctx, "udp", dnsHost)
 				}
+			} else if r.ParentProxy != nil {
+				dialFunc = r.ParentProxy.DialUDPContext
 			} else {
 				dialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
-					return net.Dial("udp", dnsHost)
+					return (&net.Dialer{}).DialContext(ctx, network, dnsHost)
 				}
 			}
 
@@ -131,8 +138,9 @@ func NewNetstackResolver(tunNet *netstack.Net, dnsAddrs []netip.Addr) *net.Resol
 	}
 }
 
-// NewStaticResolver returns a *net.Resolver that sends DNS to dnsAddrs over the system network.
-func NewStaticResolver(dnsAddrs []netip.Addr) *net.Resolver {
+// NewStaticResolver returns a *net.Resolver that sends DNS to dnsAddrs over
+// the system network, or through parent when configured.
+func NewStaticResolver(dnsAddrs []netip.Addr, parent *ParentProxy) *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -140,7 +148,10 @@ func NewStaticResolver(dnsAddrs []netip.Addr) *net.Resolver {
 				return nil, fmt.Errorf("no DNS servers configured")
 			}
 			dnsHost := net.JoinHostPort(dnsAddrs[0].String(), "53")
-			return net.Dial("udp", dnsHost)
+			if parent != nil {
+				return parent.DialUDPContext(ctx, network, dnsHost)
+			}
+			return (&net.Dialer{}).DialContext(ctx, network, dnsHost)
 		},
 	}
 }
@@ -149,12 +160,12 @@ func NewStaticResolver(dnsAddrs []netip.Addr) *net.Resolver {
 //
 //   - localDNS: do not use the tunnel for DNS; use dnsAddrs on the host, or OS if systemDNS.
 //   - systemDNS: with localDNS, use net.DefaultResolver (ignores dnsAddrs for lookups).
-func GetProxyResolver(localDNS, systemDNS bool, tunNet *netstack.Net, dnsAddrs []netip.Addr, timeout time.Duration) *net.Resolver {
+func GetProxyResolver(localDNS, systemDNS bool, tunNet *netstack.Net, dnsAddrs []netip.Addr, timeout time.Duration, parent *ParentProxy) *net.Resolver {
 	if localDNS {
 		if systemDNS {
 			return net.DefaultResolver
 		}
-		return NewStaticResolver(dnsAddrs)
+		return NewStaticResolver(dnsAddrs, parent)
 	}
 	return NewNetstackResolver(tunNet, dnsAddrs)
 }

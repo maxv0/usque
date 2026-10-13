@@ -185,6 +185,15 @@ var httpProxyCmd = &cobra.Command{
 			log.Println("Warning: --system-dns only applies with -l; ignoring")
 			systemDNS = false
 		}
+		parentProxy, err := internal.NewParentProxy(config.AppConfig.ParentProxy)
+		if err != nil {
+			cmd.Printf("Failed to configure parent proxy: %v\n", err)
+			return
+		}
+		if parentProxy != nil && localDNS && systemDNS {
+			cmd.Println("--system-dns cannot be used with parent_proxy; use -d DNS servers so DNS is routed through SOCKS")
+			return
+		}
 
 		mtu, err := cmd.Flags().GetInt("mtu")
 		if err != nil {
@@ -246,7 +255,7 @@ var httpProxyCmd = &cobra.Command{
 		}
 		defer func() { _ = tunDev.Close() }()
 
-		resolver := internal.GetProxyResolver(localDNS, systemDNS, tunNet, dnsAddrs, dnsTimeout)
+		resolver := internal.GetProxyResolver(localDNS, systemDNS, tunNet, dnsAddrs, dnsTimeout, parentProxy)
 
 		go api.MaintainTunnel(context.Background(), api.MaintainTunnelConfig{
 			TLSConfig:         tlsConfig,

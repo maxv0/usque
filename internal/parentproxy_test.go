@@ -4,12 +4,71 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestParentProxyDialContextCancellationInterruptsGreeting(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	accepted := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		close(accepted)
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	proxy := &ParentProxy{address: listener.Addr().String()}
+	result := make(chan error, 1)
+	go func() {
+		_, err := proxy.DialContext(ctx, "tcp", "198.51.100.7:443")
+		result <- err
+	}()
+
+	select {
+	case <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("parent proxy did not accept the control connection")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DialContext() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("DialContext did not return after cancellation")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("control connection was not closed after cancellation")
+	}
+}
+
+func TestMaxSOCKSUDPHeaderIncludesLongestDomain(t *testing.T) {
+	const longestDomainHeader = 3 + 1 + 1 + 255 + 2
+	if maxSOCKSUDPHeader != longestDomainHeader {
+		t.Fatalf("maxSOCKSUDPHeader = %d, want %d", maxSOCKSUDPHeader, longestDomainHeader)
+	}
+}
 
 func TestSOCKSUDPConnKeepsQUICOnSOCKSPath(t *testing.T) {
 	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})

@@ -89,6 +89,13 @@ func buildL4Proxy(cmd *cobra.Command, mode string) (l4ProxyOptions, *api.L4Proxy
 		log.Println("Warning: --system-dns only applies with -l; ignoring")
 		opts.systemDNS = false
 	}
+	parentProxy, err := internal.NewParentProxy(config.AppConfig.ParentProxy)
+	if err != nil {
+		return opts, nil, fmt.Errorf("failed to configure parent proxy: %v", err)
+	}
+	if parentProxy != nil && opts.localDNS && opts.systemDNS {
+		return opts, nil, fmt.Errorf("--system-dns cannot be used with parent_proxy; use -d DNS servers so DNS is routed through SOCKS")
+	}
 
 	privKey, err := config.AppConfig.GetEcPrivateKey()
 	if err != nil {
@@ -134,6 +141,7 @@ func buildL4Proxy(cmd *cobra.Command, mode string) (l4ProxyOptions, *api.L4Proxy
 		DNSAddrs:      dnsAddrs,
 		Timeout:       opts.dnsTimeout,
 		UseOSResolver: opts.localDNS && opts.systemDNS,
+		ParentProxy:   parentProxy,
 	}
 
 	proxy, err := api.NewL4Proxy(api.L4ProxyConfig{

@@ -236,7 +236,7 @@ func (p *L4Proxy) getOrCreateClientConn(ctx context.Context) (*l4HTTP3Client, er
 	}
 	p.connMu.Unlock()
 
-	udpConn, err := listenUDPForEndpoint(p.endpoint)
+	udpConn, err := listenUDPForEndpoint(ctx, p.endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -284,13 +284,15 @@ func (p *L4Proxy) closeClientConnIfCurrent(expected *l4HTTP3Client) {
 	closeL4HTTP3(expected.udpConn, expected.quicConn)
 }
 
-func listenUDPForEndpoint(endpoint *net.UDPAddr) (net.PacketConn, error) {
+func listenUDPForEndpoint(ctx context.Context, endpoint *net.UDPAddr) (net.PacketConn, error) {
 	parent, err := internal.NewParentProxy(config.AppConfig.ParentProxy)
-	if err != nil { return nil, err }
-	if endpoint.IP.To4() == nil {
-		return parent.ListenPacket(context.Background(), "udp", &net.UDPAddr{IP: net.IPv6zero})
+	if err != nil {
+		return nil, err
 	}
-	return parent.ListenPacket(context.Background(), "udp", &net.UDPAddr{IP: net.IPv4zero})
+	if endpoint.IP.To4() == nil {
+		return parent.ListenPacket(ctx, "udp", &net.UDPAddr{IP: net.IPv6zero})
+	}
+	return parent.ListenPacket(ctx, "udp", &net.UDPAddr{IP: net.IPv4zero})
 }
 
 func closeL4HTTP3(udpConn net.PacketConn, quicConn *quic.Conn) {

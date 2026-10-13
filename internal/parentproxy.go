@@ -22,7 +22,9 @@ const (
 	socksIPv4         = 1
 	socksDomain       = 3
 	socksIPv6         = 4
-	maxSOCKSUDPHeader = 22 // RSV, FRAG, ATYP, an IPv6 address, and a port.
+	// RSV, FRAG, ATYP, domain length, a 255-byte domain, and a port.
+	// A domain header is larger than an IPv6 header (262 bytes versus 22).
+	maxSOCKSUDPHeader = 262
 )
 
 // ParentProxy is a SOCKS5/SOCKS5H parent transport. SOCKS5 resolves target
@@ -79,11 +81,17 @@ func (p *ParentProxy) DialContext(ctx context.Context, network, address string) 
 	if err != nil {
 		return nil, fmt.Errorf("dial parent SOCKS proxy: %w", err)
 	}
-	if err := p.setContextDeadline(control, ctx); err != nil {
+	stopCancel, err := p.setContextDeadline(control, ctx)
+	if err != nil {
 		_ = control.Close()
 		return nil, err
 	}
-	if _, err := p.request(control, socksConnect, address); err != nil {
+	defer stopCancel()
+	if _, err := p.request(ctx, control, socksConnect, address); err != nil {
+		_ = control.Close()
+		return nil, parentContextError(ctx, err)
+	}
+	if err := ctx.Err(); err != nil {
 		_ = control.Close()
 		return nil, err
 	}
@@ -105,10 +113,12 @@ func (p *ParentProxy) ListenPacket(ctx context.Context, network string, laddr *n
 	if err != nil {
 		return nil, fmt.Errorf("dial parent SOCKS proxy: %w", err)
 	}
-	if err := p.setContextDeadline(control, ctx); err != nil {
+	stopCancel, err := p.setContextDeadline(control, ctx)
+	if err != nil {
 		_ = control.Close()
 		return nil, err
 	}
+	defer stopCancel()
 	udpNetwork, udpAddr, err := udpListenAddress(laddr, control.LocalAddr())
 	if err != nil {
 		_ = control.Close()
@@ -123,8 +133,13 @@ func (p *ParentProxy) ListenPacket(ctx context.Context, network string, laddr *n
 		return nil, err
 	}
 
-	relay, err := p.request(control, socksUDPAssociate, udpConn.LocalAddr().String())
+	relay, err := p.request(ctx, control, socksUDPAssociate, udpConn.LocalAddr().String())
 	if err != nil {
+		_ = control.Close()
+		_ = udpConn.Close()
+		return nil, parentContextError(ctx, err)
+	}
+	if err := ctx.Err(); err != nil {
 		_ = control.Close()
 		_ = udpConn.Close()
 		return nil, err
@@ -170,16 +185,42 @@ func udpListenAddress(requested *net.UDPAddr, controlLocal net.Addr) (string, *n
 	return "udp6", &net.UDPAddr{IP: append(net.IP(nil), local.IP.To16()...), Port: port, Zone: local.Zone}, nil
 }
 
-func (p *ParentProxy) setContextDeadline(conn net.Conn, ctx context.Context) error {
+// setContextDeadline makes SOCKS setup interruptible whether the caller supplied
+// a deadline or only cancellation. The returned function must be called before
+// the established connection is returned to its caller.
+func (p *ParentProxy) setContextDeadline(conn net.Conn, ctx context.Context) (func(), error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			return fmt.Errorf("set parent SOCKS proxy deadline: %w", err)
+			return nil, fmt.Errorf("set parent SOCKS proxy deadline: %w", err)
 		}
 	}
-	return nil
+
+	done := make(chan struct{})
+	var once sync.Once
+	stop := func() {
+		once.Do(func() { close(done) })
+	}
+	if ctx.Done() == nil {
+		return stop, nil
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return stop, nil
 }
 
-func (p *ParentProxy) request(conn net.Conn, command byte, target string) (*net.UDPAddr, error) {
+func parentContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
+func (p *ParentProxy) request(ctx context.Context, conn net.Conn, command byte, target string) (*net.UDPAddr, error) {
 	methods := []byte{socksNoAuth}
 	if p.username != "" || p.password != "" {
 		methods = append(methods, socksUserPassword)
@@ -203,7 +244,7 @@ func (p *ParentProxy) request(conn net.Conn, command byte, target string) (*net.
 		return nil, fmt.Errorf("unsupported parent SOCKS authentication method %d", selected[1])
 	}
 
-	address, err := p.requestAddress(target)
+	address, err := p.requestAddress(ctx, target)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +273,7 @@ func (p *ParentProxy) request(conn net.Conn, command byte, target string) (*net.
 		}
 		return nil, nil
 	}
-	return readSOCKSUDPAddress(conn, reply[3])
+	return readSOCKSUDPAddress(ctx, conn, reply[3])
 }
 
 func (p *ParentProxy) authenticateUserPassword(conn net.Conn) error {
@@ -257,7 +298,7 @@ func (p *ParentProxy) authenticateUserPassword(conn net.Conn) error {
 	return nil
 }
 
-func (p *ParentProxy) requestAddress(target string) ([]byte, error) {
+func (p *ParentProxy) requestAddress(ctx context.Context, target string) ([]byte, error) {
 	host, portText, err := net.SplitHostPort(target)
 	if err != nil {
 		return nil, fmt.Errorf("invalid SOCKS destination %q: %w", target, err)
@@ -268,7 +309,7 @@ func (p *ParentProxy) requestAddress(target string) ([]byte, error) {
 	}
 
 	if !p.remoteDNS && net.ParseIP(host) == nil {
-		ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 		if err != nil || len(ips) == 0 {
 			return nil, fmt.Errorf("resolve %s for parent SOCKS proxy: %w", host, err)
 		}
@@ -276,6 +317,68 @@ func (p *ParentProxy) requestAddress(target string) ([]byte, error) {
 	}
 
 	return marshalSOCKSAddress(host, uint16(port))
+}
+
+// DialUDPContext opens a connection-oriented UDP socket. With a parent SOCKS
+// proxy it creates a dedicated UDP ASSOCIATE relay; without one it behaves like
+// net.Dialer.DialContext. TCP is also accepted so net.Resolver can fall back to
+// DNS-over-TCP after a truncated UDP reply.
+func (p *ParentProxy) DialUDPContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network == "tcp" || network == "tcp4" || network == "tcp6" {
+		return p.DialContext(ctx, network, address)
+	}
+	if network != "udp" && network != "udp4" && network != "udp6" {
+		return nil, fmt.Errorf("SOCKS parent does not support %s connections", network)
+	}
+	if p == nil {
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+
+	remote, err := numericUDPAddress(address)
+	if err != nil {
+		return nil, err
+	}
+	packetConn, err := p.ListenPacket(ctx, network, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &packetConnDialConn{PacketConn: packetConn, remote: remote}, nil
+}
+
+func numericUDPAddress(address string) (*net.UDPAddr, error) {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid UDP destination %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("SOCKS UDP destination must use an IP address: %q", host)
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid UDP destination port %q: %w", portText, err)
+	}
+	return &net.UDPAddr{IP: ip, Port: int(port)}, nil
+}
+
+// packetConnDialConn adapts one PacketConn destination to net.Conn for
+// net.Resolver's Dial hook. Each resolver dial receives its own association.
+type packetConnDialConn struct {
+	net.PacketConn
+	remote net.Addr
+}
+
+func (conn *packetConnDialConn) Read(buffer []byte) (int, error) {
+	n, _, err := conn.PacketConn.ReadFrom(buffer)
+	return n, err
+}
+
+func (conn *packetConnDialConn) Write(buffer []byte) (int, error) {
+	return conn.PacketConn.WriteTo(buffer, conn.remote)
+}
+
+func (conn *packetConnDialConn) RemoteAddr() net.Addr {
+	return conn.remote
 }
 
 func marshalSOCKSAddress(host string, port uint16) ([]byte, error) {
@@ -318,7 +421,7 @@ func discardSOCKSAddress(reader io.Reader, atyp byte) error {
 	return err
 }
 
-func readSOCKSUDPAddress(reader io.Reader, atyp byte) (*net.UDPAddr, error) {
+func readSOCKSUDPAddress(ctx context.Context, reader io.Reader, atyp byte) (*net.UDPAddr, error) {
 	var host string
 	switch atyp {
 	case socksIPv4:
@@ -351,7 +454,18 @@ func readSOCKSUDPAddress(reader io.Reader, atyp byte) (*net.UDPAddr, error) {
 	if _, err := io.ReadFull(reader, portBytes[:]); err != nil {
 		return nil, err
 	}
-	return net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(portBytes[:])))))
+	port := int(binary.BigEndian.Uint16(portBytes[:]))
+	if ip := net.ParseIP(host); ip != nil {
+		return &net.UDPAddr{IP: ip, Port: port}, nil
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve parent SOCKS UDP relay %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("parent SOCKS UDP relay %s has no IP address", host)
+	}
+	return &net.UDPAddr{IP: ips[0], Port: port}, nil
 }
 
 func socksReplyError(code byte) string {

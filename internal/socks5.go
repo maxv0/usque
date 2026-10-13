@@ -30,10 +30,25 @@ type SOCKS5Config struct {
 	Logger     *log.Logger
 }
 
-// SOCKS5Server wraps txthinking/socks5; DialTCP/DialUDP are package globals (last NewSOCKS5Server wins).
+// SOCKS5Server wraps txthinking/socks5 with instance-owned outbound dialers.
 type SOCKS5Server struct {
-	cfg    SOCKS5Config
-	server *socks5.Server
+	cfg        SOCKS5Config
+	server     *socks5.Server
+	udpFlowsMu sync.Mutex
+	udpFlows   map[socksUDPFlowKey]*socksUDPFlow
+}
+
+type socksUDPFlowKey struct {
+	client      string
+	destination string
+}
+
+// socksUDPFlow is reserved before its remote socket is opened. Concurrent first
+// packets for the same flow wait on ready instead of opening duplicate relays.
+type socksUDPFlow struct {
+	ready    chan struct{}
+	exchange *socks5.UDPExchange
+	err      error
 }
 
 func NewSOCKS5Server(cfg SOCKS5Config) (*SOCKS5Server, error) {
@@ -62,15 +77,15 @@ func NewSOCKS5Server(cfg SOCKS5Config) (*SOCKS5Server, error) {
 		return nil, err
 	}
 
-	s := &SOCKS5Server{cfg: cfg, server: srv}
+	s := &SOCKS5Server{
+		cfg:      cfg,
+		server:   srv,
+		udpFlows: make(map[socksUDPFlowKey]*socksUDPFlow),
+	}
 	if cfg.TCPOnly {
 		srv.SupportedCommands = []byte{socks5.CmdConnect}
 	}
 	srv.LimitUDP = !cfg.TCPOnly
-	socks5.DialTCP = s.dialTCP
-	if !cfg.TCPOnly {
-		socks5.DialUDP = s.dialUDP
-	}
 	return s, nil
 }
 
@@ -299,7 +314,7 @@ func (s *SOCKS5Server) dialUDP(network, laddr, raddr string) (net.Conn, error) {
 func (s *SOCKS5Server) TCPHandle(srv *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
 	switch r.Cmd {
 	case socks5.CmdConnect:
-		rc, err := r.Connect(c)
+		rc, err := s.connect(c, r)
 		if err != nil {
 			return err
 		}
@@ -321,6 +336,46 @@ func (s *SOCKS5Server) TCPHandle(srv *socks5.Server, c *net.TCPConn, r *socks5.R
 	}
 
 	return socks5.ErrUnsupportCmd
+}
+
+// connect is the per-server equivalent of socks5.Request.Connect. The
+// dependency's method uses package-global DialTCP, so calling it would let a
+// later SOCKS server overwrite this server's tunnel routing.
+func (s *SOCKS5Server) connect(c *net.TCPConn, r *socks5.Request) (net.Conn, error) {
+	rc, err := s.dialTCP("tcp", "", r.Address())
+	if err != nil {
+		if replyErr := writeSOCKSReply(c, r, socks5.RepHostUnreachable, nil); replyErr != nil {
+			return nil, replyErr
+		}
+		return nil, err
+	}
+
+	if err := writeSOCKSReply(c, r, socks5.RepSuccess, rc.LocalAddr()); err != nil {
+		_ = rc.Close()
+		return nil, err
+	}
+	return rc, nil
+}
+
+func writeSOCKSReply(w io.Writer, request *socks5.Request, reply byte, bound net.Addr) error {
+	if bound == nil {
+		if request.Atyp == socks5.ATYPIPv6 {
+			_, err := socks5.NewReply(reply, socks5.ATYPIPv6, []byte(net.IPv6zero), []byte{0, 0}).WriteTo(w)
+			return err
+		}
+		_, err := socks5.NewReply(reply, socks5.ATYPIPv4, []byte{0, 0, 0, 0}, []byte{0, 0}).WriteTo(w)
+		return err
+	}
+
+	atyp, address, port, err := socks5.ParseAddress(bound.String())
+	if err != nil {
+		return err
+	}
+	if atyp == socks5.ATYPDomain {
+		address = address[1:]
+	}
+	_, err = socks5.NewReply(reply, atyp, address, port).WriteTo(w)
+	return err
 }
 
 type closeWriter interface {
@@ -382,19 +437,31 @@ func (s *SOCKS5Server) UDPHandle(srv *socks5.Server, addr *net.UDPAddr, d *socks
 	}
 
 	dst := d.Address()
-	if iue, ok := srv.UDPExchanges.Get(src + dst); ok {
-		return send(iue.(*socks5.UDPExchange), d.Data)
+	key := socksUDPFlowKey{client: src, destination: dst}
+	flow, owner := s.reserveUDPFlow(key)
+	if !owner {
+		<-flow.ready
+		if flow.err != nil {
+			return flow.err
+		}
+		if flow.exchange == nil {
+			return fmt.Errorf("SOCKS UDP flow %s is not ready", dst)
+		}
+		return send(flow.exchange, d.Data)
 	}
 
 	select {
 	case udpRelaySem <- struct{}{}:
 	default:
-		return fmt.Errorf("too many active UDP relay exchanges")
+		err := fmt.Errorf("too many active UDP relay exchanges")
+		s.completeUDPFlow(key, flow, nil, err)
+		return err
 	}
 
-	rc, err := socks5.DialUDP("udp", "", dst)
+	rc, err := s.dialUDP("udp", "", dst)
 	if err != nil {
 		<-udpRelaySem
+		s.completeUDPFlow(key, flow, nil, err)
 		return err
 	}
 	ue := &socks5.UDPExchange{
@@ -404,14 +471,15 @@ func (s *SOCKS5Server) UDPHandle(srv *socks5.Server, addr *net.UDPAddr, d *socks
 	if err := send(ue, d.Data); err != nil {
 		_ = ue.RemoteConn.Close()
 		<-udpRelaySem
+		s.completeUDPFlow(key, flow, nil, err)
 		return err
 	}
-	srv.UDPExchanges.Set(src+dst, ue, -1)
+	s.completeUDPFlow(key, flow, ue, nil)
 
-	go func(ue *socks5.UDPExchange, dst string) {
+	go func(ue *socks5.UDPExchange, dst string, key socksUDPFlowKey, flow *socksUDPFlow) {
 		defer func() {
 			_ = ue.RemoteConn.Close()
-			srv.UDPExchanges.Delete(ue.ClientAddr.String() + dst)
+			s.removeUDPFlow(key, flow)
 			<-udpRelaySem
 		}()
 		// A stack [65507]byte here escapes to the heap per goroutine (~64 KiB each);
@@ -461,7 +529,37 @@ func (s *SOCKS5Server) UDPHandle(srv *socks5.Server, addr *net.UDPAddr, d *socks
 				}
 			}
 		}
-	}(ue, dst)
+	}(ue, dst, key, flow)
 
 	return nil
+}
+
+func (s *SOCKS5Server) reserveUDPFlow(key socksUDPFlowKey) (*socksUDPFlow, bool) {
+	s.udpFlowsMu.Lock()
+	defer s.udpFlowsMu.Unlock()
+	if flow, ok := s.udpFlows[key]; ok {
+		return flow, false
+	}
+	flow := &socksUDPFlow{ready: make(chan struct{})}
+	s.udpFlows[key] = flow
+	return flow, true
+}
+
+func (s *SOCKS5Server) completeUDPFlow(key socksUDPFlowKey, flow *socksUDPFlow, exchange *socks5.UDPExchange, err error) {
+	s.udpFlowsMu.Lock()
+	flow.exchange = exchange
+	flow.err = err
+	if err != nil && s.udpFlows[key] == flow {
+		delete(s.udpFlows, key)
+	}
+	close(flow.ready)
+	s.udpFlowsMu.Unlock()
+}
+
+func (s *SOCKS5Server) removeUDPFlow(key socksUDPFlowKey, flow *socksUDPFlow) {
+	s.udpFlowsMu.Lock()
+	if s.udpFlows[key] == flow {
+		delete(s.udpFlows, key)
+	}
+	s.udpFlowsMu.Unlock()
 }

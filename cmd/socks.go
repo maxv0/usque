@@ -183,6 +183,15 @@ var socksCmd = &cobra.Command{
 			log.Println("Warning: --system-dns only applies with -l; ignoring")
 			systemDNS = false
 		}
+		parentProxy, err := internal.NewParentProxy(config.AppConfig.ParentProxy)
+		if err != nil {
+			cmd.Printf("Failed to configure parent proxy: %v\n", err)
+			return
+		}
+		if parentProxy != nil && localDNS && systemDNS {
+			cmd.Println("--system-dns cannot be used with parent_proxy; use -d DNS servers so DNS is routed through SOCKS")
+			return
+		}
 
 		mtu, err := cmd.Flags().GetInt("mtu")
 		if err != nil {
@@ -267,6 +276,7 @@ var socksCmd = &cobra.Command{
 			DNSAddrs:      dnsAddrs,
 			Timeout:       dnsTimeout,
 			UseOSResolver: localDNS && systemDNS,
+			ParentProxy:   parentProxy,
 		}
 		if !localDNS {
 			resolver.TunNet = tunNet
